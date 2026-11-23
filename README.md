@@ -12,8 +12,6 @@
 
 在 DSH 插件管理中添加所需插件的本地目录，例如 `E:\ai\dsh-toolkit\plugins\codex-signin`。安装以本地链接引用源码：仓库移位前先处理插件链接；更新后通过插件管理核对启用状态和来源。不要手改 DSH profile，也不要将凭据或会话数据放入仓库。
 
-## 测试与归档
+## 测试
 
-在仓库根目录运行 `node plugins/compaction-effort/effort.test.js` 检查 Codex 压缩策略，不发模型请求。历史工具的隔离测试见[归档说明](archive/README.md)。
-
-`archive/` 保存两份一次性历史标题迁移的脱敏源码，只供参考和隔离测试，不安装、不重新运行真实迁移。执行收据、会话日志和本机配置不纳入版本控制。
+在仓库根目录运行 `node plugins/compaction-effort/effort.test.js` 检查 Codex 压缩策略，不发模型请求。
