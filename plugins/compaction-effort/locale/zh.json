@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex 压缩摘要推理档位",
+    "description": "openai-codex 下所有模型的上下文压缩请求在档位缺省或为 off、none 时使用 medium。其他明确档位、主对话和会话标题不变。"
+  }
+}

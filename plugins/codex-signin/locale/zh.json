@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex 登录",
+    "description": "在模型设置页为 OpenAI Codex 提供 ChatGPT 订阅登录入口。"
+  }
+}

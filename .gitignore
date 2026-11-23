@@ -1,0 +1,12 @@
+node_modules/
+.dsh/
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+*.sqlite*
+*.db*
+coverage/
+.DS_Store
+Thumbs.db

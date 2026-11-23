@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session titles",
+    "description": "Name new sessions MMDD｜type｜topic from their first prompt. An excerpt goes to the selected model when available, with local rules as a fallback. On Windows, a task command such as ‘开启 #128’ can reuse the original title from Agent Steward through a read-only lookup. Replaces the built-in first-prompt provider and respects manual titles."
+  }
+}

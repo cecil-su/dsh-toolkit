@@ -1,0 +1,7 @@
+- id: session-title-llm
+  name: '@deepseek-ai/dsh-session-title-first-prompt-llm'
+  disabled: true
+
+- insert:
+    - id: local-session-title
+      name: '@local/session-title'

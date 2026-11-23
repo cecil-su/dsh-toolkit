@@ -1,0 +1,4 @@
+- insert:
+    - id: compaction-effort
+      name: '@local/compaction-effort'
+      config: {}

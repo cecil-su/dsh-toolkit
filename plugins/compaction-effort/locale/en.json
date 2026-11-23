@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex compaction reasoning effort",
+    "description": "Use medium for omitted, off or none effort on context compaction for any openai-codex model. Preserve other explicit efforts, main chats and session titles."
+  }
+}

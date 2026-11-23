@@ -1,0 +1,3 @@
+- insert:
+    - id: codex-signin
+      name: '@local/dsh-codex-signin'

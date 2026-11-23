@@ -1,0 +1,17 @@
+{
+  "name": "@local/session-title",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Name sessions from their first prompt, or reuse the original title of a linked Agent Steward task.",
+  "type": "module",
+  "exports": {
+    ".": "./compact.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["compact.js", "lookup.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md"],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": { "patch": "./cordis.patch.yml" }
+  }
+}

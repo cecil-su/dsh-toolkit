@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex sign-in",
+    "description": "Adds a ChatGPT subscription sign-in entry for the OpenAI Codex provider on the Models settings page."
+  }
+}
