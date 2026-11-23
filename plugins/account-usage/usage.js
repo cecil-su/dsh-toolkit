@@ -5,6 +5,8 @@ const ENDPOINT = 'https://chatgpt.com/backend-api/wham/usage'
 const MAX_BYTES = 64 * 1024
 const FRESH_MS = 60_000
 const COOLDOWN_MS = 10_000
+const MAX_SAMPLE_AGE_MS = 15 * FRESH_MS
+const TEMPORARY = Symbol('temporary upstream failure')
 const UNAVAILABLE = Object.freeze({ status: 'unavailable' })
 const SIGNED_OUT = Object.freeze({ status: 'signed-out' })
 const object = x => x !== null && typeof x === 'object' && !Array.isArray(x)
@@ -24,7 +26,8 @@ function identity(record, now) {
   if (claim?.['https://api.openai.com/auth']?.chatgpt_account_id !== grant.accountId ||
       !Number.isSafeInteger(claim.exp) || claim.exp <= now / 1000) return UNAVAILABLE
   // No bearer, grant, refresh token or identifier is retained in the cache.
-  return { scope: createHash('sha256').update(token).digest('hex'), token, account: grant.accountId }
+  return { scope: createHash('sha256').update(token).digest('hex'), token, account: grant.accountId,
+    expires: Math.min(grant.expires, claim.exp * 1000) }
 }
 
 function remaining(used) {
@@ -66,7 +69,7 @@ async function readJson(response, signal) {
   try {
     for (;;) {
       signal.throwIfAborted()
-      const { done, value } = await reader.read()
+      const { done, value } = await reader.read().catch(() => { throw TEMPORARY })
       if (done) break
       size += value.byteLength
       if (size > MAX_BYTES) throw new Error()
@@ -85,38 +88,63 @@ function retryMs(header, now) {
 // Credential changes and disposal invalidate even pending record reads. Join
 // only a lookup for the same current token; verify it again before publishing.
 export function createUsage({ readRecord, fetchImpl = globalThis.fetch, now = Date.now, monotonic = () => performance.now(), timeoutMs = 8000 }) {
-  let generation = 0, scope, flight, cache, next = 0, disposed = false
+  let generation = 0, scope, flight, cache, lastCheckedAt, failedAt, next = 0, disposed = false
   function clear() {
     generation++
     flight?.abort.abort()
-    scope = flight = cache = undefined
+    scope = flight = cache = lastCheckedAt = failedAt = undefined
     next = 0
   }
   // One monotonic deadline covers the initial grant, upstream body, verification
   // and any shared-flight wait. A late joiner cannot extend the shared lookup.
-  async function bounded(work, deadline) {
+  async function bounded(work, deadline, fallback = UNAVAILABLE) {
     let timer
     const left = deadline - monotonic()
-    if (left <= 0) return UNAVAILABLE
+    if (left <= 0) return fallback
     try {
-      const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(UNAVAILABLE), left) })
+      const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(fallback), left) })
       const value = await Promise.race([timeout, work()])
-      return monotonic() >= deadline ? UNAVAILABLE : value
+      // A known denial must not become a temporary timeout at a deadline boundary.
+      return value === UNAVAILABLE || monotonic() < deadline ? value : fallback
     } finally { clearTimeout(timer) }
   }
   async function current(deadline) {
     try { return await bounded(async () => identity(await readRecord(RECORD_KEY), now()), deadline) }
     catch { return UNAVAILABLE }
   }
-  function cached(t) {
-    if (!cache || t < cache.checkedAt || t - cache.checkedAt >= FRESH_MS) return null
+  // Return only windows still applicable to this *verified* grant. Never change
+  // checkedAt, or make a previous success fresh by polling during backoff.
+  function project(t, id) {
+    if (!cache) return null
+    const validUntil = Math.min(cache.checkedAt + MAX_SAMPLE_AGE_MS, id.expires)
+    if (t < cache.checkedAt || t >= validUntil) { cache = undefined; return null }
     const live = w => w?.resetAt != null && w.resetAt <= t ? null : w
     const week = live(cache.week), short = live(cache.short)
-    if (week === cache.week && short === cache.short) return cache
-    // Keep the original cache intact: after cooldown the missing window needs
-    // an upstream read, not a new TTL on the surviving sample.
-    if (t < next) return week || short ? { ...cache, week, short, retryAt: next } : { ...UNAVAILABLE, retryAt: next }
-    return null
+    return week || short ? { ...cache, week, short, validUntil } : null
+  }
+  function duringBackoff(available, id) {
+    if (failedAt !== undefined) {
+      const snapshot = available || { ...UNAVAILABLE, validUntil: id.expires,
+        ...(lastCheckedAt !== undefined ? { checkedAt: lastCheckedAt } : {}) }
+      return { ...snapshot, refreshFailed: true, failedAt, retryAt: next }
+    }
+    return available && available.week === cache.week && available.short === cache.short
+      ? available : cache ? { ...(available || UNAVAILABLE), retryAt: next } : UNAVAILABLE
+  }
+  async function sample(id, signal) {
+    let res
+    try {
+      // Never follow a redirect/send credentials to a new destination. Manual
+      // mode also lets us distinguish a sign-in redirect from a network outage.
+      res = await fetchImpl(ENDPOINT, { method: 'GET', redirect: 'manual', credentials: 'omit', cache: 'no-store', signal,
+        headers: { Authorization: `Bearer ${id.token}`, 'ChatGPT-Account-Id': id.account, Accept: 'application/json' } })
+    } catch { return TEMPORARY }
+    if (res.redirected) return UNAVAILABLE
+    if (res.status === 429) return { retry: retryMs(res.headers.get('retry-after'), now()) }
+    if (res.status === 408 || (res.status >= 500 && res.status <= 599)) return TEMPORARY
+    if (res.status !== 200) return UNAVAILABLE // includes 401/403: no fallback to last known value
+    try { return parseUsage(await readJson(res, signal), id.account, now()) }
+    catch (err) { return err === TEMPORARY ? TEMPORARY : UNAVAILABLE }
   }
   async function get(force = false) {
     const deadline = monotonic() + timeoutMs
@@ -128,35 +156,37 @@ export function createUsage({ readRecord, fetchImpl = globalThis.fetch, now = Da
     if (scope && scope !== id.scope) clear()
     scope = id.scope
     if (flight) return bounded(() => flight.promise, deadline)
-    const t = now(), available = cached(t)
-    if ((!force || t < next) && available) return available
-    if (t < next) return UNAVAILABLE
+    const t = now(), available = project(t, id)
+    if (t < next) return duringBackoff(available, id)
+    if (!force && failedAt === undefined && available && t - cache.checkedAt < FRESH_MS &&
+        available.week === cache.week && available.short === cache.short) return available
     next = t + COOLDOWN_MS
     const epoch = generation, abort = new AbortController()
-    const timer = setTimeout(() => abort.abort(), Math.max(0, deadline - monotonic()))
     const promise = (async () => {
-      let value = UNAVAILABLE, retry = 0
-      try {
-        const res = await fetchImpl(ENDPOINT, { method: 'GET', redirect: 'error', credentials: 'omit', cache: 'no-store', signal: abort.signal,
-          headers: { Authorization: `Bearer ${id.token}`, 'ChatGPT-Account-Id': id.account, Accept: 'application/json' } })
-        if (res.status === 429) retry = retryMs(res.headers.get('retry-after'), now())
-        if (res.status === 200 && !res.redirected) value = parseUsage(await readJson(res, abort.signal), id.account, now())
-      } catch { /* Never expose transport errors, response bodies, headers or provider messages. */ }
-      if (abort.signal.aborted || epoch !== generation) return UNAVAILABLE
-      const verified = await current(deadline)
-      if (epoch !== generation || abort.signal.aborted) return UNAVAILABLE
-      if (verified.scope !== scope) { clear(); return verified.status === 'signed-out' ? SIGNED_OUT : UNAVAILABLE }
-      if (retry) next = Math.max(next, now() + retry)
-      cache = value.status === 'ready' ? value : undefined
-      return value
-    })().finally(() => {
-      clearTimeout(timer)
+      // Reserve time to verify identity even if upstream never settles. Without
+      // that second read, a network timeout could expose a logged-out account.
+      const upstreamDeadline = deadline - Math.min(1000, timeoutMs / 4)
+      const value = await bounded(() => sample(id, abort.signal), upstreamDeadline, TEMPORARY)
       abort.abort() // Also closes rejected, oversized and non-200 response bodies.
+      if (epoch !== generation) return UNAVAILABLE
+      const verified = await current(deadline)
+      if (epoch !== generation) return UNAVAILABLE
+      if (verified.scope !== id.scope) { clear(); return verified.status === 'signed-out' ? SIGNED_OUT : UNAVAILABLE }
+      const finished = now()
+      if (value === TEMPORARY || value.retry) {
+        failedAt = finished
+        next = Math.max(next, finished + (value.retry || FRESH_MS))
+        return duringBackoff(project(finished, verified), verified)
+      }
+      failedAt = undefined
+      cache = value.status === 'ready' ? value : undefined // A real response replaces *all* windows.
+      lastCheckedAt = cache?.checkedAt
+      return project(finished, verified) || UNAVAILABLE
+    })().finally(() => {
+      abort.abort()
       if (flight?.abort === abort) flight = undefined
     })
     flight = { promise, abort }
-    // Drop the old sample on refresh failure, timeout or cancellation.
-    cache = undefined
     return promise
   }
   return { get, invalidate: clear, dispose() { disposed = true; clear() } }

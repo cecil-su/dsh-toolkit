@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
         missing: '此窗口暂无有效读数', due: '已到重置时间，等待新读数', unknownReset: '重置时间未提供',
         balance: '剩余 {left} · 已用 {used}', reset: '{time} 重置（{left}后）',
         days: '{d}天 {h}小时', hours: '{h}小时 {m}分', minutes: '{m}分', soon: '不到 1 分钟',
-        updated: '更新于 {time}', refresh: '刷新', refreshing: '正在刷新…',
+        updated: '上次成功更新：{time}', failed: '{time} 刷新失败', retry: '将于 {time} 自动重试', refresh: '刷新', refreshing: '正在刷新…',
       },
       en: {
         week: '7-day window', short: '5-hour window', title: 'Codex account limits',
@@ -28,15 +28,15 @@ window.__ModuleLoader__.load({
         missing: 'No current reading for this window', due: 'Reset time reached; awaiting new figures', unknownReset: 'Reset time not reported',
         balance: '{left} left · {used} used', reset: 'Resets {time} (in {left})',
         days: '{d}d {h}h', hours: '{h}h {m}m', minutes: '{m} min', soon: 'less than 1 min',
-        updated: 'Updated {time}', refresh: 'Refresh', refreshing: 'Refreshing…',
+        updated: 'Last successful update: {time}', failed: 'Refresh failed at {time}', retry: 'Automatic retry at {time}', refresh: 'Refresh', refreshing: 'Refreshing…',
       },
     };
 
     const validTime = value => Number.isSafeInteger(value) && value > 0 && value < 8.64e15;
     function readWindow(value) {
       const percent = value?.remainingPercent;
-      if (!Number.isFinite(percent) || percent < 0 || percent > 100) return null;
-      return { remainingPercent: percent, resetAt: validTime(value.resetAt) ? value.resetAt : null };
+      if (!Number.isFinite(percent) || percent < 0 || percent > 100 || (value.resetAt != null && !validTime(value.resetAt))) return null;
+      return { remainingPercent: percent, resetAt: value.resetAt ?? null };
     }
     function decode(value, elapsed = 0) {
       if (value?.status === 'signed-out') return { status: 'signed-out' };
@@ -47,10 +47,20 @@ window.__ModuleLoader__.load({
       // can age the sample in flight; use an upper bound rather than extend TTL.
       const work = Number.isSafeInteger(value.hostWorkMs) && value.hostWorkMs >= 0 ? value.hostWorkMs : 0;
       const clock = { serverNow: value.serverNow, transitMs: Math.max(0, elapsed - work), ...retry };
-      if (value.status !== 'ready') return { ...UNAVAILABLE, ...clock };
+      const verifiedFailure = value.refreshFailed === true && validTime(value.failedAt) && value.failedAt <= value.serverNow &&
+        (value.checkedAt === undefined || (validTime(value.checkedAt) && value.checkedAt <= value.failedAt)) && !!retry.retryAt;
+      if (value.status !== 'ready') return { ...UNAVAILABLE, ...clock, ...(verifiedFailure && validTime(value.validUntil) ?
+        { ...(value.checkedAt ? { checkedAt: value.checkedAt } : {}), refreshFailed: true, failedAt: value.failedAt, validUntil: value.validUntil } : {}) };
       if (!validTime(value.checkedAt) || value.checkedAt > value.serverNow) return UNAVAILABLE;
       const week = readWindow(value.week), short = readWindow(value.short);
-      return week || short ? { status: 'ready', week, short, checkedAt: value.checkedAt, ...clock } : UNAVAILABLE;
+      // A lease authorizes this specific response, not a local fallback on errors.
+      // An older Host without leases retains its original one-minute lifetime.
+      if (value.validUntil !== undefined && (!validTime(value.validUntil) || value.validUntil <= value.checkedAt)) return UNAVAILABLE;
+      const validUntil = Math.min(value.validUntil ?? value.checkedAt + MINUTE, value.checkedAt + 15 * MINUTE);
+      const failure = value.refreshFailed === true;
+      if (failure && (!validTime(value.validUntil) || !verifiedFailure)) return UNAVAILABLE;
+      return week || short ? { status: 'ready', week, short, checkedAt: value.checkedAt, validUntil, ...clock,
+        ...(failure ? { refreshFailed: true, failedAt: value.failedAt } : {}) } : UNAVAILABLE;
     }
     function percent(value, locale) {
       const nf = new Intl.NumberFormat(locale, { style: 'percent', maximumFractionDigits: 1 });
@@ -67,6 +77,7 @@ window.__ModuleLoader__.load({
       return t('minutes', { m: minutes });
     }
     function due(item, now) { return item?.resetAt != null && item.resetAt <= now; }
+    function expiredView(data, now) { return data.retryAt > now ? { ...UNAVAILABLE, retryAt: data.retryAt } : UNAVAILABLE; }
 
     // The shell transport (when supplied) owns authentication. Never construct an
     // external URL, look up a token, follow redirects, or forward an error body.
@@ -86,39 +97,41 @@ window.__ModuleLoader__.load({
     // A revoked request cannot repopulate the view after hide/logout/reconnect.
     function createStore(fetchUsage, isVisible, connected) {
       const listeners = new Set();
-      let snapshot = { data: WAIT, busy: false }, flight, timer, dead = false;
-      let offset = 0;
+      let snapshot = { data: WAIT, busy: false }, flight, timer, boundary, dead = false;
+      let offset = 0, parked;
       const hostNow = () => offset + performance.now();
       function publish(data, busy) {
+        clearTimeout(boundary);
+        const t = hostNow();
+        if (data.status === 'ready' || data.refreshFailed) {
+          const end = data.validUntil ?? data.checkedAt + MINUTE;
+          if (t >= end) data = busy ? WAIT : expiredView(data, t);
+          else {
+            // Repaint an expired window/lease even during a slow refresh or a long Retry-After.
+            // This timer never calls the network and cannot revive data from a cancelled generation.
+            const edge = Math.min(...[end, data.week?.resetAt, data.short?.resetAt].filter(v => v > t));
+            boundary = setTimeout(() => { if (snapshot.data === data && snapshot.busy === busy) publish(data, busy); }, Math.min(2_147_483_647, Math.ceil(edge - t)));
+          }
+        }
         snapshot = { data, busy };
         for (const fn of listeners) fn();
       }
       function cancel() {
+        clearTimeout(boundary);
         clearTimeout(timer);
         const old = flight;
         flight = undefined;
         if (old) { clearTimeout(old.timeout); old.controller.abort(); }
       }
-      function active() { return !dead && listeners.size > 0 && isVisible() && connected(); }
+      function active() { return !dead && listeners.size > 0 && isVisible() && !!connected(); }
       function load(manual = false) {
-        if (!active() || flight) return;
+        if (!active() || flight || (manual && snapshot.data.retryAt > hostNow())) return;
         clearTimeout(timer);
         const current = { controller: new AbortController() };
         flight = current;
-        const old = snapshot.data;
-        // A manual refresh can straddle the reset/TTL. Re-render at that
-        // boundary even when its network reply has not arrived yet.
-        function showPending() {
-          if (flight !== current) return;
-          const t = hostNow();
-          const fresh = old.status === 'ready' && t < old.checkedAt + MINUTE;
-          publish(old.status === 'ready' && !fresh ? WAIT : old, true);
-          if (fresh) {
-            const edges = [old.checkedAt + MINUTE, old.week?.resetAt, old.short?.resetAt].filter(v => v > t);
-            timer = setTimeout(showPending, Math.min(...edges) - t);
-          }
-        }
-        showPending();
+        // While checking, keep only the Host-authorized view of this generation.
+        // Its display lease and reset boundaries are enforced independently of the request.
+        publish(snapshot.data, true);
         function settle(data) {
           if (current !== flight) return;
           clearTimeout(timer);
@@ -127,18 +140,17 @@ window.__ModuleLoader__.load({
           if (validTime(data.serverNow)) offset = data.serverNow + (data.transitMs || 0) - performance.now();
           const t = hostNow();
           let delay = data.status === 'signed-out' ? 5 * MINUTE : MINUTE;
-          if (validTime(data.retryAt)) delay = Math.max(1, data.retryAt - data.serverNow);
-          if (data.status === 'ready') {
-            const end = data.checkedAt + MINUTE;
-            if (!validTime(data.serverNow) || t >= end) {
-              // If return transit, not sampling, crossed the TTL, request the next baseline promptly.
-              if (data.serverNow < end) delay = Math.min(delay, Math.max(250, end - data.serverNow));
-              data = UNAVAILABLE;
-            } else {
-              delay = Math.min(delay, end - t);
-              for (const w of [data.week, data.short]) {
-                if (w?.resetAt != null) delay = Math.min(delay, w.resetAt > t ? w.resetAt - t + 1 : Math.max(250, w.resetAt - data.serverNow));
-              }
+          if (validTime(data.retryAt)) {
+            // A retry hint takes precedence over the sample age AND reset deadlines.
+            // Use a full normal interval for past hints, not a millisecond retry loop.
+            if (data.retryAt > t) delay = Math.min(3_600_000, Math.ceil(data.retryAt - t));
+          } else if (data.status === 'ready') {
+            const sampleDue = data.checkedAt + MINUTE;
+            delay = sampleDue > t ? Math.ceil(sampleDue - t) : MINUTE;
+            for (const edge of [data.validUntil, data.week?.resetAt, data.short?.resetAt]) {
+              // If the edge elapsed in transit, request a new sample soon. Never
+              // hammer an upstream that repeatedly returns an already-due window.
+              if (edge > data.serverNow) delay = Math.min(delay, Math.max(250, Math.ceil(edge - t) + 1));
             }
           }
           publish(data, false);
@@ -148,9 +160,29 @@ window.__ModuleLoader__.load({
         Promise.resolve().then(() => current.controller.signal.aborted ? UNAVAILABLE : fetchUsage(manual, current.controller.signal))
           .then(settle, () => settle(UNAVAILABLE));
       }
-      function invalidate() {
+      function discard() {
+        parked = undefined;
         cancel();
         publish(connected() ? WAIT : UNAVAILABLE, false);
+      }
+      function invalidate() { discard(); load(); }
+      function visibilityChanged() {
+        if (!isVisible()) {
+          if (!parked && listeners.size && connected() && snapshot.data.status === 'ready') {
+            parked = { data: snapshot.data, generation: connected(), wall: Date.now(), mono: performance.now() };
+          }
+          cancel();
+          publish(WAIT, false);
+          return;
+        }
+        const previous = parked;
+        parked = undefined;
+        // Credential/connection events still hard-clear parked data while hidden.
+        // Frozen/BFCache pages discard it as subscription continuity is not assured.
+        if (previous && active() && previous.generation === connected() && Date.now() >= previous.wall) {
+          offset += Math.max(0, (Date.now() - previous.wall) - (performance.now() - previous.mono));
+          publish(previous.data, false);
+        }
         load();
       }
       return {
@@ -158,10 +190,10 @@ window.__ModuleLoader__.load({
         subscribe(fn) {
           listeners.add(fn);
           if (listeners.size === 1) invalidate();
-          return () => { listeners.delete(fn); if (!listeners.size) { cancel(); snapshot = { data: WAIT, busy: false }; } };
+          return () => { listeners.delete(fn); if (!listeners.size) { parked = undefined; cancel(); snapshot = { data: WAIT, busy: false }; } };
         },
-        refresh: () => load(true), invalidate,
-        dispose() { dead = true; listeners.clear(); cancel(); snapshot = { data: WAIT, busy: false }; },
+        refresh: () => load(true), invalidate, visibilityChanged, discard,
+        dispose() { dead = true; parked = undefined; listeners.clear(); cancel(); snapshot = { data: WAIT, busy: false }; },
       };
     }
 
@@ -219,13 +251,22 @@ window.__ModuleLoader__.load({
     }
     // Do not treat an exhausted window as missing, or an unknown one as empty.
     function meterValue(data, now) {
-      return data.status === 'ready' && data.week && !due(data.week, now) ? data.week.remainingPercent : null;
+      return data.status === 'ready' && now < (data.validUntil ?? data.checkedAt + MINUTE) && data.week && !due(data.week, now) ? data.week.remainingPercent : null;
     }
     function dockLabel(value, locale) {
       return `7d ${value == null ? '—' : percent(value, locale)}`;
     }
+    function quotaView(sample, now, busy, canRefresh, locale) {
+      const data = (sample.status === 'ready' || sample.refreshFailed) && now >= (sample.validUntil ?? sample.checkedAt + MINUTE) ? expiredView(sample, now) : sample;
+      const rows = data.status !== 'ready' ? [] : ['week', 'short'].filter(key => data[key] && !due(data[key], now));
+      const value = meterValue(data, now), retryAt = data.retryAt > now ? data.retryAt : null;
+      return { data, rows, value, badge: dockLabel(value, locale), failedAt: data.refreshFailed ? data.failedAt : null,
+        checkedAt: data.checkedAt ?? null, retryAt, refreshDisabled: busy || !canRefresh || retryAt !== null };
+    }
     function Usage({ store, t, locale }) {
-      const { data, busy } = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+      const { data: sample, busy } = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+      const now = store.now(), canRefresh = store.canRefresh();
+      const { data, rows, value, badge, failedAt, checkedAt, retryAt, refreshDisabled } = quotaView(sample, now, busy, canRefresh, locale);
       const [open, setOpen] = React.useState(false);
       const buttonRef = React.useRef(null), panelRef = React.useRef(null);
       React.useLayoutEffect(() => {
@@ -258,7 +299,6 @@ window.__ModuleLoader__.load({
         const id = setInterval(() => tick(n => n + 1), MINUTE);
         return () => clearInterval(id);
       }, [open, data]);
-      const now = store.now();
       const brief = data.status !== 'ready' ? t(data.status) : !data.week ? t('missingWeek')
         : due(data.week, now) ? t('dueWeek') : t('brief', { value: percent(data.week.remainingPercent, locale) });
       function timestamp(ms) {
@@ -274,9 +314,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'acu-note' }, !item ? t('missing') : !valid ? t('due') : item.resetAt
             ? t('reset', { time: timestamp(item.resetAt), left: countdown(item.resetAt - now, t) }) : t('unknownReset')));
       }
-      const value = meterValue(data, now);
       const label = `${t('title')} · ${brief}`;
-      const canRefresh = store.canRefresh();
       const uid = React.useId();
       const panelId = `acu-panel-weekly-${uid}`;
       return h(React.Fragment, null,
@@ -287,27 +325,41 @@ window.__ModuleLoader__.load({
             h('circle', { cx: 7, cy: 7, r: 5.5, strokeWidth: 2, stroke: 'var(--dsw-alias-border-l2)', strokeDasharray: value == null ? '2 2' : undefined }),
             value > 0 && h('circle', { cx: 7, cy: 7, r: 5.5, pathLength: 100, strokeWidth: 2, stroke: 'currentColor',
               strokeDasharray: `${value} 100`, transform: 'rotate(-90 7 7)' })),
-          dockLabel(value, locale)),
+          badge),
         open && createPortal(h('section', { ref: panelRef, className: 'acu-panel', id: panelId, tabIndex: -1, role: 'dialog', 'aria-label': t('title') },
           h('strong', { className: 'acu-number' }, t('heading')),
-          data.status === 'ready' ? ['week', 'short'].map(row) : h('p', null,
+          data.status === 'ready' ? rows.map(row) : h('p', null,
             t(data.status === 'signed-out' ? 'signInHint' : data.status === 'unavailable' ? (canRefresh ? 'failureHint' : 'offlineHint') : 'loading')),
+          failedAt && h('p', { className: 'acu-note' }, t('failed', { time: timestamp(failedAt) })),
+          retryAt && h('p', { className: 'acu-note' }, t('retry', { time: timestamp(retryAt) })),
           h('div', { className: 'acu-footer' },
-            h('span', { role: 'status', 'aria-atomic': true }, busy ? t('refreshing') : data.status === 'ready' ? t('updated', { time: timestamp(data.checkedAt) }) : t(data.status)),
-            h('button', { type: 'button', disabled: busy || !canRefresh, onClick: store.refresh }, t('refresh')))), buttonRef.current.ownerDocument.body));
+            h('div', { role: 'status', 'aria-atomic': true },
+              checkedAt && h('div', null, t('updated', { time: timestamp(checkedAt) })),
+              busy ? t('refreshing') : !checkedAt && t(data.status)),
+            h('button', { type: 'button', disabled: refreshDisabled, onClick: store.refresh }, t('refresh')))), buttonRef.current.ownerDocument.body));
     }
 
     return {
       inject: ['slots', 'locale', 'remote', 'connection'],
-      createStore, decode, percent, due, request, meterValue, dockLabel, panelPlacement,
+      createStore, decode, percent, due, request, meterValue, dockLabel, panelPlacement, quotaView,
       apply(ctx) {
         const generation = ctx.connection.generation;
-        const store = createStore(request, () => !document.hidden, () => !!generation.getSnapshot());
+        const store = createStore(request, () => !document.hidden, () => generation.getSnapshot());
         ctx.effect(() => ctx.locale.register(NS, copy), 'account-usage: copy');
         ctx.effect(() => {
-          document.addEventListener('visibilitychange', store.invalidate);
+          const restored = e => { if (e.persisted) store.visibilityChanged(); };
+          document.addEventListener('visibilitychange', store.visibilityChanged);
+          document.addEventListener('freeze', store.discard);
+          window.addEventListener('pagehide', store.discard);
+          window.addEventListener('pageshow', restored);
           const off = generation.subscribe(store.invalidate);
-          return () => { document.removeEventListener('visibilitychange', store.invalidate); off(); store.dispose(); };
+          return () => {
+            document.removeEventListener('visibilitychange', store.visibilityChanged);
+            document.removeEventListener('freeze', store.discard);
+            window.removeEventListener('pagehide', store.discard);
+            window.removeEventListener('pageshow', restored);
+            off(); store.dispose();
+          };
         }, 'account-usage: page lifetime');
         ctx.remote.$on('credentials/record-updated', key => { if (key === KEY) store.invalidate(); });
         ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({

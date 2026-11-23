@@ -20,7 +20,7 @@ function harness(options = {}) {
   h.usage = createUsage({ readRecord: async key => {
     assert.equal(key, RECORD_KEY); return h.record
   }, now: () => h.time, timeoutMs: h.timeout ?? 1000, fetchImpl: async (url, init) => {
-    assert.equal(url, 'https://chatgpt.com/backend-api/wham/usage'); assert.equal(init.redirect, 'error')
+    assert.equal(url, 'https://chatgpt.com/backend-api/wham/usage'); assert.equal(init.redirect, 'manual')
     assert.equal(init.method, 'GET'); assert.equal(init.credentials, 'omit')
     const headers = new Headers(init.headers)
     assert.ok(headers.get('Authorization') === `Bearer ${h.record.payload.access}`)
@@ -33,7 +33,7 @@ function harness(options = {}) {
 
 test('account-level windows are matched by duration and projected without upstream fields', async () => {
   const h = harness({ responder: () => Response.json(payload(short, weekly)) })
-  assert.deepEqual(await h.usage.get(), { status: 'ready', checkedAt: base,
+  assert.deepEqual(await h.usage.get(), { status: 'ready', checkedAt: base, validUntil: base + 900_000,
     week: { remainingPercent: 67.5, resetAt: base + 86400_000 }, short: { remainingPercent: 0, resetAt: null } })
   h.record = undefined
   assert.deepEqual(await h.usage.get(), { status: 'signed-out' }); assert.equal(h.count, 1)
@@ -62,7 +62,7 @@ test('unsupported, duplicated, invalid, reset and cross-account data fail closed
   assert.equal(live.week, null); assert.equal(live.short.remainingPercent, 0)
 })
 
-test('shared manual cooldown and read TTL; no retained result after failures or reset', async () => {
+test('shared manual cooldown and read TTL; no retained result after auth denial or reset', async () => {
   const h = harness()
   await h.usage.get(); h.time += 3000
   assert.equal((await h.usage.get(true)).checkedAt, base); assert.equal(h.count, 1)
@@ -104,8 +104,9 @@ test('decimal tenths subtract exactly, without rounding genuine sub-tenth readin
 
 test('429 is honored on both methods; a different account receives no stale response', async () => {
   const h = harness({ responder: () => new Response(null, { status: 429, headers: { 'retry-after': '120' } }) })
-  assert.deepEqual(await h.usage.get(), unavailable); h.time += 110000
-  assert.deepEqual(await h.usage.get(true), unavailable); assert.equal(h.count, 1)
+  const waiting = { ...unavailable, refreshFailed: true, failedAt: base, retryAt: base + 120000, validUntil: base + 86_400_000 }
+  assert.deepEqual(await h.usage.get(), waiting); h.time += 110000
+  assert.deepEqual(await h.usage.get(true), waiting); assert.equal(h.count, 1)
   h.time += 10000; await h.usage.get(); assert.equal(h.count, 2)
   h.record = grant('fixture-B'); h.responder = () => Response.json({ ...payload(null, short), account_id: 'fixture-B' })
   assert.equal((await h.usage.get()).week, null); assert.equal(h.count, 3)
@@ -132,7 +133,9 @@ test('oversized declared and chunked bodies, transport errors, malformed JSON, r
     () => new Response('unexpected'), () => { throw new Error('sensitive transport failure') },
     () => new Response(null, { status: 302, headers: { location: 'https://invalid.test/' } }),
     init => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('timeout'))))]) {
-    const h = harness({ responder, timeout: 20 }); assert.deepEqual(await h.usage.get(), unavailable); assert.equal(h.count, 1)
+    const h = harness({ responder, timeout: 80 }), result = await h.usage.get()
+    assert.equal(result.status, 'unavailable'); assert.equal(result.week, undefined); assert.equal(result.checkedAt, undefined)
+    assert.doesNotMatch(JSON.stringify(result), /secret|fixture|https?:/); assert.equal(h.count, 1)
   }
 })
 
@@ -156,6 +159,86 @@ test('a stuck credential read times out, and events discard pending snapshots', 
   resolveRead(grant())
   const pending = usage.get(); usage.invalidate(); resolveRead(grant())
   assert.deepEqual(await pending, unavailable); assert.equal(called, 0)
+})
+
+test('baseline and manual transient failures preserve last verified measurement and throttle retries', async () => {
+  for (const [responder, wait] of [
+    [() => { throw Error('private network text') }, 60_000],
+    [() => new Response(null, { status: 503 }), 60_000],
+    [() => new Response(null, { status: 408 }), 60_000],
+    [() => new Response(null, { status: 429, headers: { 'retry-after': '150' } }), 150_000],
+    [() => new Promise(() => {}), 60_000], // stubborn transport ignores abort
+  ]) {
+    for (const manual of [false, true]) {
+      const h = harness({ timeout: 160 }), sampled = await h.usage.get()
+      h.time += manual ? 10_000 : 60_000; h.responder = responder
+      const expected = { ...sampled, refreshFailed: true, failedAt: h.time, retryAt: h.time + wait }
+      assert.deepEqual(await h.usage.get(manual), expected)
+      h.time = expected.retryAt - 1
+      assert.deepEqual(await h.usage.get(), expected); assert.deepEqual(await h.usage.get(true), expected); assert.equal(h.count, 2)
+      h.time++; h.responder = () => Response.json(payload(weekly, null))
+      const recovered = await h.usage.get(); assert.equal(h.count, 3); assert.equal(recovered.checkedAt, h.time)
+      assert.equal(recovered.short, null); assert.equal(recovered.refreshFailed, undefined); assert.equal(recovered.failedAt, undefined)
+    }
+  }
+})
+
+test('reset boundaries trim individual stale windows, then retain only verified timestamps (including after the age cap)', async () => {
+  for (const first of ['week', 'short']) {
+    const end = { week: base + (first === 'week' ? 20_000 : 33_000), short: base + (first === 'short' ? 20_000 : 33_000) }
+    const h = harness({ responder: () => Response.json(payload({ ...weekly, reset_at: end.week / 1000 }, { ...short, reset_at: end.short / 1000 })) })
+    const initial = await h.usage.get(); h.time += 10_000
+    h.responder = () => new Response(null, { status: 429, headers: { 'retry-after': '1200' } })
+    const failed = await h.usage.get(true)
+    h.time = end[first]
+    assert.deepEqual(await h.usage.get(), { ...failed, [first]: null })
+    for (const instant of [base + 33_000, initial.validUntil, failed.retryAt - 1]) {
+      h.time = instant; const meta = await h.usage.get()
+      assert.deepEqual(meta, { status: 'unavailable', checkedAt: base, refreshFailed: true, failedAt: failed.failedAt,
+        retryAt: failed.retryAt, validUntil: h.record.payload.expires }); assert.equal(h.count, 2)
+    }
+    h.record = undefined; assert.deepEqual(await h.usage.get(), { status: 'signed-out' })
+  }
+  const h = harness(); const sampled = await h.usage.get(); h.time = sampled.validUntil
+  h.responder = () => new Response(null, { status: 502 }); const meta = await h.usage.get()
+  assert.equal(meta.status, 'unavailable'); assert.equal(meta.checkedAt, base); assert.equal(meta.week, undefined); assert.equal(meta.short, undefined)
+})
+
+test('never salvage a snapshot across permission, identity or schema failures; verified new successes may be weekly only', async () => {
+  for (const responder of [() => new Response(null, { status: 401 }), () => new Response(null, { status: 403 }),
+    () => new Response(null, { status: 302, headers: { location: 'https://invalid.test/sign-in' } }),
+    () => Response.json({ ...payload(), account_id: 'another' }), () => Response.json(payload(weekly, weekly)),
+    () => new Response('{sensitive invalid JSON', { headers: { 'content-type': 'application/json' } })]) {
+    const h = harness(); await h.usage.get(); h.time += 10_000; h.responder = responder
+    assert.deepEqual(await h.usage.get(true), unavailable)
+    h.time += 60_000; h.responder = () => { throw Error() }
+    const later = await h.usage.get(); assert.equal(later.status, 'unavailable'); assert.equal(later.checkedAt, undefined)
+  }
+  const fake5h = { ...short, limit_window_seconds: 3600 }, response = payload(fake5h, weekly)
+  response.additional_rate_limits.push({ rate_limit: { primary_window: short } })
+  const h = harness(); await h.usage.get(); h.time += 60_000; h.responder = () => Response.json(response)
+  const weeklyOnly = await h.usage.get(); assert.equal(weeklyOnly.short, null); assert.equal(weeklyOnly.week.remainingPercent, 67.5)
+  h.time += 60_000; h.responder = () => { throw Error() }; assert.equal((await h.usage.get()).short, null)
+})
+
+test('temporary errors require a fresh second credential read, including timeout, expiry and silent replacement', async () => {
+  for (const outcome of ['switch', 'logout', 'invalid', 'changed-token', 'cannot-verify', 'timeout-verify', 'expiry', 'event']) {
+    const expiry = base + 90_000; let rec = grant('fixture-A', { expires: expiry }), t = base, fail = false, failRead = false
+    const usage = createUsage({ now: () => t, timeoutMs: 120,
+      readRecord: () => { if (failRead && outcome === 'cannot-verify') throw Error('private credentials error'); if (failRead && outcome === 'timeout-verify') return new Promise(() => {}); return rec },
+      fetchImpl: () => {
+        if (!fail) return Response.json(payload())
+        if (outcome === 'switch') rec = grant('fixture-B')
+        if (outcome === 'logout') rec = undefined
+        if (outcome === 'invalid') rec = { kind: 'api-key' }
+        if (outcome === 'changed-token') rec = grant('fixture-A', { access: rec.payload.access + 'rotated' })
+        if (outcome === 'expiry') t = expiry
+        if (outcome === 'event') usage.invalidate()
+        failRead = true; throw Error('offline')
+      } })
+    assert.equal((await usage.get()).validUntil, expiry); fail = true; t += 60_000
+    assert.deepEqual(await usage.get(), outcome === 'logout' ? { status: 'signed-out' } : unavailable, outcome); usage.dispose()
+  }
 })
 
 test('plugin registers only exact owner-protected Connection routes; no inputs or caching', async () => {

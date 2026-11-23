@@ -5,11 +5,11 @@ import vm from 'node:vm';
 
 // Exercise the real transport and state machine without rendering a mock UI.
 const source = readFileSync(new URL('./client.js', import.meta.url), 'utf8');
-function plugin(globals = {}) {
+function plugin(globals = {}, modules = {}) {
   let api;
   vm.runInNewContext(source, { window: { __ModuleLoader__: { load(entry) {
     assert.equal(entry.id, '@local/account-usage');
-    api = entry.factory(name => { assert.ok(['react', 'react-dom'].includes(name)); return {}; });
+    api = entry.factory(name => { assert.ok(['react', 'react-dom'].includes(name)); return modules[name] ?? {}; });
   } } }, Date, performance, AbortController, setTimeout, clearTimeout, ...globals });
   return api;
 }
@@ -21,7 +21,7 @@ const plain = x => JSON.parse(JSON.stringify(x));
 test('wire projection preserves missing windows, endpoints and no other fields', () => {
   const { decode, percent, due } = plugin();
   assert.deepEqual(plain(decode({ ...reading(1000), other: 'discard', short: null })),
-    { status: 'ready', checkedAt: 1000, serverNow: 1000, transitMs: 0, short: null, week: { remainingPercent: 0, resetAt: 6000 } });
+    { status: 'ready', checkedAt: 1000, validUntil: 61_000, serverNow: 1000, transitMs: 0, short: null, week: { remainingPercent: 0, resetAt: 6000 } });
   for (const bad of [undefined, [], { status: 'ready', checkedAt: NaN },
     { ...reading(), week: { remainingPercent: '0' }, short: null }]) assert.equal(decode(bad).status, 'unavailable');
   assert.equal(decode({ status: 'signed-out' }).status, 'signed-out');
@@ -115,6 +115,39 @@ test('a successful registered route supplies a separate Host clock on cache hits
   } finally { dispose(); }
 });
 
+test('real Host route → Client decode → panel projection: weekly-only, 503, recovery, and another account', async t => {
+  const base = 1_800_000_000_000;
+  let clock = base, account = 'fixture-A', used = 29, error = false, calls = 0, onCredentials, dispose;
+  t.mock.method(Date, 'now', () => clock);
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return error ? new Response(null, { status: 503 }) :
+    Response.json({ account_id: account, plan_type: 'unknown-future-plan', rate_limit: { primary_window: { used_percent: used, limit_window_seconds: 604800 } } }); });
+  const readRecord = () => { const exp = base + 3_600_000;
+    const claim = { exp: exp / 1000, 'https://api.openai.com/auth': { chatgpt_account_id: account } };
+    return { kind: 'grant', payload: { type: 'oauth', expires: exp, accountId: account,
+      access: `fixture.${Buffer.from(JSON.stringify(claim)).toString('base64url')}.fixture` } }; };
+  const routes = new Map(); (await import('./index.js')).apply({ credentials: { readRecord },
+    on(_name, fn) { onCredentials = fn; }, effect(fn) { dispose = fn(); },
+    connection: { fetch: { register(route) { routes.set(route.path, route); } } } });
+  const api = plugin({ fetch: (path, init) => routes.get('/' + path).fetch(new Request('https://fixture.invalid/' + path, init)) });
+  const get = force => api.request(force, new AbortController().signal);
+  try {
+    const view = sample => api.quotaView(sample, clock, false, true, 'zh');
+    const fresh = await get(false); const first = view(fresh);
+    assert.equal(first.badge, '7d 71%'); assert.deepEqual(plain(first.rows), ['week']); assert.equal(first.failedAt, null);
+    clock += 61_000; error = true;
+    const fallback = await get(false); const failed = view(fallback);
+    assert.equal(failed.checkedAt, fresh.checkedAt); assert.equal(failed.failedAt, clock);
+    assert.equal(failed.badge, '7d 71%'); assert.deepEqual(plain(failed.rows), ['week']);
+    assert.equal(failed.refreshDisabled, true); assert.ok(failed.retryAt > clock);
+    assert.equal((await get(true)).failedAt, fallback.failedAt); assert.equal(calls, 2);
+    clock = fallback.retryAt + 1; error = false; used = 31;
+    const recovered = view(await get(false)); assert.equal(recovered.badge, '7d 69%'); assert.equal(recovered.failedAt, null);
+    account = 'fixture-B'; error = true; onCredentials('llm-pi-ai/openai-codex');
+    const b = view(await get(true)); assert.equal(b.checkedAt, null);
+    assert.equal(b.badge, '7d —'); assert.deepEqual(plain(b.rows), []); assert.equal(calls, 4);
+  } finally { dispose(); }
+});
+
 test('server time rather than browser wall time controls TTL, window resets and retry-after-cooldown', async () => {
   for (const skew of [-65_000, 65_000]) {
     const base = 1_800_000_000_000; let mono = 500, wall = base + skew, i = 0;
@@ -125,7 +158,7 @@ test('server time rather than browser wall time controls TTL, window resets and 
     function fire(ms) { const [id, task] = [...timers].find(([, t]) => t.ms === ms) || [];
       assert.ok(task, `timer ${ms}`); timers.delete(id); mono += ms; wall -= 86_400_000; task.fn(); }
     const week = { remainingPercent: 77, resetAt: null };
-    const pair = { ...reading(base), week, short: { remainingPercent: 10, resetAt: base + 3000 } };
+    const pair = { ...reading(base), validUntil: base + 900_000, week, short: { remainingPercent: 10, resetAt: base + 3000 } };
     store.subscribe(() => {});
     try {
       await turn(); replies.shift()(api.decode(pair)); await turn();
@@ -135,9 +168,10 @@ test('server time rather than browser wall time controls TTL, window resets and 
       assert.equal(store.getSnapshot().data.checkedAt, base); assert.equal(store.getSnapshot().data.week.remainingPercent, 77);
       fire(6999); await turn(); assert.equal(replies.length, 1);
       replies.shift()(api.decode({ ...pair, short: null, serverNow: base + 10_000 })); await turn();
-      fire(50_000); await turn(); assert.equal(store.getSnapshot().data.status, 'loading');
-      // Delayed old cache cannot appear fresh just because it arrived now.
-      replies.shift()(api.decode({ ...pair, serverNow: base + 60_000 })); await turn();
+      fire(50_000); await turn(); assert.equal(store.getSnapshot().busy, true);
+      assert.equal(api.meterValue(store.getSnapshot().data, store.now()), 77);
+      // A transport failure has no authority to reuse data, even inside the display lease.
+      replies.shift()({ status: 'unavailable' }); await turn();
       assert.equal(store.getSnapshot().data.status, 'unavailable');
     } finally { store.dispose(); assert.equal(timers.size, 0); }
   }
@@ -201,4 +235,87 @@ test('the first reset or TTL triggers a new baseline; overdue responses and old 
     fire(60_000); await turn(); pending.shift()(reading(now - 60_001, now)); await turn();
     assert.equal(store.getSnapshot().data.status, 'unavailable');
   } finally { store.dispose(); assert.equal(timers.size, 0); }
+});
+
+function fixture() {
+  const base = 1_800_000_000_000; let now = base, id = 0;
+  const timers = new Map(), pending = [], env = { visible: true, generation: 1 };
+  const api = plugin({ performance: { now: () => now }, Date: { now: () => now },
+    setTimeout: (fn, ms) => { timers.set(++id, { at: now + ms, fn }); return id; }, clearTimeout: key => timers.delete(key) });
+  const store = api.createStore((manual, signal) => new Promise(resolve => pending.push({ resolve, manual, signal })),
+    () => env.visible, () => env.generation);
+  const wire = (extra = {}) => ({ ...reading(base), week: { remainingPercent: 71, resetAt: null }, short: null,
+    validUntil: base + 900_000, serverNow: now, ...extra });
+  async function advance(ms) {
+    const end = now + ms;
+    for (let n = 0; ; n++) {
+      const k = [...timers].sort(([, a], [, b]) => a.at - b.at)[0];
+      if (!k || k[1].at > end) break;
+      assert.ok(n < 25, 'unexpected polling loop'); timers.delete(k[0]); now = k[1].at; k[1].fn(); await turn();
+    }
+    now = end;
+  }
+  return { api, base, env, store, wire, advance, pending, timers,
+    reply: async wire => { assert.ok(pending.length); pending.shift().resolve(api.decode(wire)); await turn(); } };
+}
+
+test('verified fallback keeps the same digits and times, suppresses retries until due and expires each boundary independently', async () => {
+  const { api, base, store, wire, advance, pending, reply, timers } = fixture();
+  const a = store.subscribe(() => {}), b = store.subscribe(() => {});
+  try {
+    await turn(); await reply(wire());
+    await advance(60_000);
+    assert.equal(pending.length, 1); assert.equal(store.getSnapshot().busy, true);
+    assert.equal(api.dockLabel(api.meterValue(store.getSnapshot().data, store.now()), 'zh'), '7d 71%');
+    await reply(wire({ refreshFailed: true, failedAt: base + 60_000, retryAt: base + 660_000,
+      validUntil: base + 160_000, week: { remainingPercent: 71, resetAt: base + 100_000 } }));
+    const data = store.getSnapshot().data; assert.equal(data.checkedAt, base); assert.equal(data.failedAt, base + 60_000);
+    store.refresh(); await turn(); assert.equal(pending.length, 0, 'manual refresh honors Retry-After too');
+    await advance(40_000); assert.equal(api.meterValue(store.getSnapshot().data, store.now()), null);
+    await advance(60_000); assert.deepEqual(plain(store.getSnapshot().data), { status: 'unavailable', retryAt: base + 660_000 });
+    await advance(499_999); assert.equal(pending.length, 0); await advance(1); assert.equal(pending.length, 1);
+    // Even a repeated old retry time cannot cause an immediate loop.
+    await reply(wire({ status: 'unavailable', retryAt: base + 660_000 }));
+    await advance(59_999); assert.equal(pending.length, 0);
+  } finally { a(); b(); store.dispose(); assert.equal(timers.size, 0); }
+});
+
+test('foreground restores only a live lease within unbroken credential and connection subscriptions', async () => {
+  for (const mode of ['same', 'changed generation', 'credential event', 'freeze', 'expired']) {
+    const { store, reply, wire, env, advance, pending } = fixture();
+    const off = store.subscribe(() => {});
+    try {
+      await turn(); await reply(wire()); store.refresh(); await turn();
+      const late = pending.shift(); assert.ok(late.manual);
+      env.visible = false; store.visibilityChanged(); assert.ok(late.signal.aborted);
+      if (mode === 'changed generation') env.generation = 2;
+      if (mode === 'credential event') store.invalidate();
+      if (mode === 'freeze') store.discard();
+      await advance(mode === 'expired' ? 900_001 : 61_000);
+      env.visible = true; store.visibilityChanged(); await turn(); assert.equal(pending.length, 1);
+      assert.equal(store.getSnapshot().data.status === 'ready', mode === 'same');
+      late.resolve(wire()); await turn(); assert.equal(store.getSnapshot().data.status === 'ready', mode === 'same');
+      await reply({ status: 'signed-out' }); assert.equal(store.getSnapshot().data.status, 'signed-out');
+    } finally { off(); store.dispose(); }
+  }
+});
+
+test('badge and detail projections distinguish failure, absent windows, real zero and expiry', () => {
+  const base = 1_800_000_000_000, now = base + 61_000, api = plugin();
+  const sample = { ...reading(base), validUntil: base + 900_000, week: { remainingPercent: 71, resetAt: null },
+    refreshFailed: true, failedAt: now, retryAt: now + 600_000 };
+  const view = (s, at = now) => api.quotaView(s, at, false, true, 'zh');
+  for (const short of [null, { remainingPercent: 22, resetAt: now }, { remainingPercent: 0, resetAt: now + 1 }]) {
+    const result = view({ ...sample, short });
+    assert.equal(result.badge, '7d 71%'); assert.equal(result.checkedAt, base); assert.equal(result.failedAt, now);
+    assert.equal(result.retryAt, sample.retryAt); assert.equal(result.refreshDisabled, true);
+    assert.deepEqual(plain(result.rows), short?.resetAt > now ? ['week', 'short'] : ['week']);
+  }
+  assert.deepEqual(plain(view({ ...sample, week: null, short: { remainingPercent: 0, resetAt: null } }).rows), ['short']);
+  const raw = { ...sample, status: 'unavailable', serverNow: now, secret: 'never' };
+  const tombstone = api.decode(raw); assert.equal(tombstone.week, undefined);
+  assert.equal(view(tombstone).badge, '7d —'); assert.equal(view(tombstone).checkedAt, base); assert.equal(view(tombstone).failedAt, now);
+  for (const unavailable of [view(api.decode({ ...raw, refreshFailed: false })), view(tombstone, tombstone.validUntil)]) {
+    assert.equal(unavailable.checkedAt, null); assert.equal(unavailable.failedAt, null);
+  }
 });

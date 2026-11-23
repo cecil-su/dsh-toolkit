@@ -5,7 +5,7 @@
 | 插件 | 作用 |
 | --- | --- |
 | [codex-signin](plugins/codex-signin/) | 在模型设置中提供 Codex 登录入口 |
-| [account-usage](plugins/account-usage/) | 聊天时查看 Codex 账号周剩余，展开查看 5 小时额度和重置时间 |
+| [account-usage](plugins/account-usage/) | 聊天时查看 Codex 账号周剩余，展开查看套餐提供的窗口、重置时间和刷新状态 |
 | [session-title](plugins/session-title/) | 自动生成简短的会话标题，保留手动改名；识别到明确的任务指令时可沿用 Agent Steward 的任务标题 |
 | [compaction-effort](plugins/compaction-effort/) | 为 `openai-codex` 所有模型的上下文压缩请求补上 `medium`；不改主对话 |
 

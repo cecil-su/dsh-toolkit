@@ -26,8 +26,10 @@ export function apply(ctx) {
           return new Response(null, { status: 400, headers })
         }
         const started = performance.now()
-        const value = request.signal.aborted ? { status: 'unavailable' } : await usage.get(method === 'refresh')
-        // The sample timestamp is never re-stamped on cache hits. Provide a separate
+        const result = !request.signal.aborted && await usage.get(method === 'refresh')
+        const value = request.signal.aborted ? { status: 'unavailable' } : result
+        // checkedAt always describes the measurement, including a verified fallback.
+        // failedAt/retryAt describe a separate refresh attempt. Provide a separate
         // clock reference at dispatch (including how much of the RTT was Host work).
         const timed = value.status === 'ready' || value.retryAt != null
         return Response.json(timed ? { ...value, serverNow: Date.now(), hostWorkMs: Math.floor(performance.now() - started) } : value, { headers })
