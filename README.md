@@ -5,6 +5,7 @@
 | 插件 | 作用 |
 | --- | --- |
 | [codex-signin](plugins/codex-signin/) | 在模型设置中提供 Codex 登录入口 |
+| [account-usage](plugins/account-usage/) | 聊天时查看 Codex 账号周剩余，展开查看 5 小时额度和重置时间 |
 | [session-title](plugins/session-title/) | 自动生成简短的会话标题，保留手动改名；识别到明确的任务指令时可沿用 Agent Steward 的任务标题 |
 | [compaction-effort](plugins/compaction-effort/) | 为 `openai-codex` 所有模型的上下文压缩请求补上 `medium`；不改主对话 |
 
@@ -14,4 +15,4 @@
 
 ## 测试
 
-在仓库根目录运行 `node plugins/compaction-effort/effort.test.js` 检查 Codex 压缩策略，不发模型请求。
+在仓库根目录运行 `node --test "plugins/*/*.test.*"` 检查压缩策略和账号额度插件。测试使用模拟数据，不读取真实账号，也不发模型请求。
